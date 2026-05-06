@@ -1,17 +1,29 @@
-"""Monitor http://aliens.gov/ and https://aliens.gov/ for changes.
+"""Monitor http://aliens.gov/ and https://aliens.gov/ for going live.
+
+Alerting rule:
+- Alert ONLY when a target transitions from a "not live" state (404, 5xx,
+  SSL errors, timeouts, connection errors, etc.) to a "live" state
+  (HTTP 2xx or 3xx).
+- Do NOT alert on:
+    * SSL / TLS errors appearing or changing flavor
+    * 404 -> SSL error, error -> different error
+    * Body/hash changes on 404 pages (these often contain timestamps
+      or request IDs and produce noise)
+    * Live -> not-live transitions (site going down is not the event
+      we care about right now)
 
 Writes:
-- state_http_status.txt / state_http_hash.txt
+- state_http_status.txt  / state_http_hash.txt
 - state_https_status.txt / state_https_hash.txt
-- changed.txt: created only when:
-  1. HTTPS state changes, e.g. ERROR:SSLError -> 200
-  2. HTTP response changes, including body/status/redirect target
-- error.txt: written for debugging/logging only; the workflow should not notify from it
+- changed.txt: created only when a target goes live
+- error.txt:   diagnostic log of fetch failures (workflow does not notify
+  from this file)
 
 Notes:
-- HTTP and HTTPS are monitored separately.
-- Redirects are not followed, so redirect behavior can be detected directly.
-- HTTPS certificate failures are recorded as state, not allowed to crash the run.
+- HTTP and HTTPS are tracked independently.
+- Redirects are not followed, so a redirect to a real site shows up as
+  a 3xx and counts as "live".
+- TLS/network failures are recorded as state, not raised.
 """
 
 import hashlib
@@ -56,13 +68,10 @@ def sha256_text(value: str) -> str:
 
 
 def build_state_from_response(response: requests.Response) -> tuple[str, str]:
-    """Return a status string and hash string for a normal HTTP response."""
+    """Return a (status, hash) pair for a normal HTTP response."""
     status = str(response.status_code)
     location = response.headers.get("Location", "")
 
-    # Include status, redirect target, final URL, and raw body bytes in hash.
-    # For HTTP, this means we detect body changes, status changes, and redirect changes.
-    # For HTTPS, we only use the status for alerting, but still store the hash for logs/state.
     hash_input = b"\n".join(
         [
             f"status:{status}".encode("utf-8"),
@@ -73,22 +82,35 @@ def build_state_from_response(response: requests.Response) -> tuple[str, str]:
         ]
     )
 
-    digest = hashlib.sha256(hash_input).hexdigest()
-    return status, digest
+    return status, hashlib.sha256(hash_input).hexdigest()
 
 
 def build_state_from_error(error: requests.exceptions.RequestException) -> tuple[str, str]:
-    """Return a stable status/hash pair for network/TLS failures."""
+    """Return a stable (status, hash) pair for network/TLS failures.
+
+    Status is kept broad (e.g. ``ERROR:SSLError``) so flavor changes in the
+    underlying error message do not by themselves count as state changes.
+    """
     error_type = type(error).__name__
-    error_text = str(error)
-
-    # Keep status broad/readable, e.g. ERROR:SSLError.
-    # This avoids false alerts from tiny changes in the full SSL error text.
     status = f"ERROR:{error_type}"
-
-    # Store the full error hash for debugging/state, but HTTPS alerting only uses status.
-    digest = sha256_text(f"{error_type}:{error_text}")
+    digest = sha256_text(f"{error_type}:{error}")
     return status, digest
+
+
+def is_live(status: str | None) -> bool:
+    """True iff the status indicates the site is serving content.
+
+    Live = HTTP 2xx or 3xx (a real response, including redirects to the
+    actual site). Everything else — 4xx, 5xx, SSL errors, timeouts,
+    connection errors, no prior state — counts as "not live".
+    """
+    if not status or status.startswith("ERROR:"):
+        return False
+    try:
+        code = int(status)
+    except ValueError:
+        return False
+    return 200 <= code < 400
 
 
 def check_target(target: dict) -> tuple[str | None, str | None]:
@@ -111,7 +133,6 @@ def check_target(target: dict) -> tuple[str | None, str | None]:
             headers=HEADERS,
             allow_redirects=False,
         )
-
         status, new_hash = build_state_from_response(response)
         location = response.headers.get("Location", "")
 
@@ -134,32 +155,10 @@ def check_target(target: dict) -> tuple[str | None, str | None]:
 
     if first_run:
         print(f"{name.upper()} first run: initialized state, no alert sent.")
-    else:
-        if name == "https":
-            # HTTPS: only alert when the high-level state changes.
-            # Examples:
-            # - ERROR:SSLError -> 200
-            # - ERROR:SSLError -> 301
-            # - 404 -> 200
-            # - 200 -> ERROR:SSLError
-            #
-            # Do not alert merely because the detailed SSL error text/hash changes.
-            if old_status != status:
-                change_message = (
-                    f"HTTPS state changed for {url}: {old_status} -> {status}"
-                )
-
-        elif name == "http":
-            # HTTP: alert when the response state changes.
-            # The hash includes status, redirect target, final URL, and body.
-            # So this catches HTML changes, status changes, and redirect changes.
-            if old_hash != new_hash:
-                change_message = (
-                    f"HTTP response changed for {url}.\n"
-                    f"Status: {status}\n"
-                    f"Old hash: {old_hash}\n"
-                    f"New hash: {new_hash}"
-                )
+    elif is_live(status) and not is_live(old_status):
+        change_message = (
+            f"{name.upper()} {url} appears LIVE: {old_status} -> {status}"
+        )
 
     status_file.write_text(status + "\n")
     hash_file.write_text(new_hash + "\n")
@@ -167,13 +166,12 @@ def check_target(target: dict) -> tuple[str | None, str | None]:
     if change_message:
         print(f"Change detected: {change_message}")
     else:
-        print(f"No change for {name.upper()}.")
+        print(f"No live transition for {name.upper()}.")
 
     return change_message, error_message
 
 
 def main() -> None:
-    # Clear stale files from previous runs.
     for f in (CHANGED_FILE, ERROR_FILE):
         if f.exists():
             f.unlink()
@@ -183,17 +181,15 @@ def main() -> None:
 
     for target in TARGETS:
         change_message, error_message = check_target(target)
-
         if change_message:
             changes.append(change_message)
-
         if error_message:
             errors.append(error_message)
 
     if changes:
         CHANGED_FILE.write_text("\n\n".join(changes) + "\n")
 
-    # Debug/logging only. Your workflow should not send notifications from error.txt.
+    # Diagnostic log only — the workflow does not notify from this file.
     if errors:
         ERROR_FILE.write_text("\n\n".join(errors) + "\n")
 
